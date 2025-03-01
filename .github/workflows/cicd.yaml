@@ -1,0 +1,98 @@
+name: CI/CD Yandex Cloud
+
+on:
+  push:
+    branches: [ main ]
+    # Условие: запускать Terraform job при изменениях в папке infra,
+    # а job по приложению при изменениях в папке app.
+    paths:
+      - 'infra/**'
+      - 'app/**'
+      - '.github/workflows/**'
+
+jobs:
+  # Job 1: Обновление инфраструктуры Terraform
+  terraform:
+    name: "Terraform Apply"
+    runs-on: ubuntu-latest
+    if: contains(join(github.event.head_commit.added, github.event.head_commit.modified, github.event.head_commit.removed), 'infra/')
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Установка Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_wrapper: false  # устанавливаем terraform CLI
+
+      - name: Инициализация Terraform
+        working-directory: infra
+        env:
+          YC_TOKEN: ${{ secrets.YC_TOKEN }}
+        run: terraform init -input=false
+
+      - name: Применение Terraform
+        working-directory: infra
+        env:
+          YC_TOKEN: ${{ secrets.YC_TOKEN }}
+        run: terraform apply -auto-approve -input=false
+
+  # Job 2: Сборка и push Docker-образа
+  docker_build:
+    name: "Build & Push Docker"
+    runs-on: ubuntu-latest
+    needs: terraform   # запуск после завершения Terraform (можно убрать, если они независимы)
+    if: contains(join(github.event.head_commit.added, github.event.head_commit.modified, github.event.head_commit.removed), 'app/')
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Установка Yandex Cloud CLI
+        run: |
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -a
+          echo "${{ secrets.YC_TOKEN }}" > token.txt
+          ./yc init --cloud-id ${YC_CLOUD_ID} --folder-id ${YC_FOLDER_ID} --token "$(cat token.txt)" --non-interactive
+
+      - name: Логин в Yandex Container Registry
+        env:
+          YC_TOKEN: ${{ secrets.YC_TOKEN }}
+        run: |
+          # Получаем IAM-токен для Docker login
+          IAM_TOKEN=$(${HOME}/yandex-cloud/bin/yc iam create-token)
+          echo $IAM_TOKEN | docker login --username oauth --password-stdin cr.yandex
+
+      - name: Сборка Docker-образа
+        run: docker build -t cr.yandex/${{ secrets.YCR_REGISTRY_ID }}/test-app:latest ./app
+
+      - name: Push Docker-образа в Registry
+        run: docker push cr.yandex/${{ secrets.YCR_REGISTRY_ID }}/test-app:latest
+
+  # Job 3: Деплой приложения в Kubernetes
+  deploy_k8s:
+    name: "Deploy to Kubernetes"
+    runs-on: ubuntu-latest
+    needs: docker_build
+    if: needs.docker_build.result == 'success'
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Установка kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Получение kubeconfig из Yandex.Cloud
+        env:
+          YC_TOKEN: ${{ secrets.YC_TOKEN }}
+          YC_CLOUD_ID: ${{ secrets.YC_CLOUD_ID }}
+          YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
+        run: |
+          # Устанавливаем Yandex CLI (если не кэшировалось с предыдущего шага)
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -a
+          # Авторизуемся 
+          ${HOME}/yandex-cloud/bin/yc config set token $YC_TOKEN
+          ${HOME}/yandex-cloud/bin/yc config set cloud-id $YC_CLOUD_ID
+          ${HOME}/yandex-cloud/bin/yc config set folder-id $YC_FOLDER_ID
+          # Получаем контекст Kubernetes ( kubeconfig )
+          ${HOME}/yandex-cloud/bin/yc managed-kubernetes cluster get-credentials --name ${YCLUSTER_NAME} --external --force
+
+      - name: Применение манифестов Kubernetes
+        run: kubectl apply -f app/k8s-manifests/
