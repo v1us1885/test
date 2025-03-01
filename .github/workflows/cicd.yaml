@@ -1,98 +1,139 @@
-name: CI/CD Yandex Cloud
+# Workflow для автоматической сборки Docker-образа, тегирования, отправки в Docker Hub и деплоя в Kubernetes (Yandex Cloud)
+name: CI/CD
 
+# Запускаем workflow при push в ветку main и при создании нового тега (формата v*)
 on:
   push:
     branches: [ main ]
-    # Условие: запускать Terraform job при изменениях в папке infra,
-    # а job по приложению при изменениях в папке app.
-    paths:
-      - 'infra/**'
-      - 'app/**'
-      - '.github/workflows/**'
+    tags: [ 'v*' ]
+
+# Даем токену GitHub Actions права на запись содержимого репозитория (для создания тегов)
+permissions:
+  contents: write
 
 jobs:
-  # Job 1: Обновление инфраструктуры Terraform
-  terraform:
-    name: "Terraform Apply"
+  build_deploy:
+    name: Build, Tag, Push and Deploy
     runs-on: ubuntu-latest
-    if: contains(join(github.event.head_commit.added, github.event.head_commit.modified, github.event.head_commit.removed), 'infra/')
-    steps:
-      - uses: actions/checkout@v3
 
-      - name: Установка Terraform
-        uses: hashicorp/setup-terraform@v2
+    # Переменные окружения для удобства (используем секреты, если они заданы)
+    env:
+      KUBECONFIG_CONTENT: ${{ secrets.KUBE_CONFIG }}
+      YC_SA_JSON_CREDENTIALS: ${{ secrets.YC_SA_JSON_CREDENTIALS }}
+
+    steps:
+      # Шаг 1: Checkout - получаем исходный код репозитория
+      - name: Checkout code
+        uses: actions/checkout@v3
         with:
-          terraform_wrapper: false  # устанавливаем terraform CLI
+          fetch-depth: 0  # Загружаем всю историю git (полноценный clone) для доступа к тегам
+        # Получаем код репозитория (включая историю коммитов и тегов)
 
-      - name: Инициализация Terraform
-        working-directory: infra
-        env:
-          YC_TOKEN: ${{ secrets.YC_TOKEN }}
-        run: terraform init -input=false
-
-      - name: Применение Terraform
-        working-directory: infra
-        env:
-          YC_TOKEN: ${{ secrets.YC_TOKEN }}
-        run: terraform apply -auto-approve -input=false
-
-  # Job 2: Сборка и push Docker-образа
-  docker_build:
-    name: "Build & Push Docker"
-    runs-on: ubuntu-latest
-    needs: terraform   # запуск после завершения Terraform (можно убрать, если они независимы)
-    if: contains(join(github.event.head_commit.added, github.event.head_commit.modified, github.event.head_commit.removed), 'app/')
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Установка Yandex Cloud CLI
+      # Шаг 2: Определение тега версии для Docker-образа
+      - name: Determine image tag
+        id: version
         run: |
-          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -a
-          echo "${{ secrets.YC_TOKEN }}" > token.txt
-          ./yc init --cloud-id ${YC_CLOUD_ID} --folder-id ${YC_FOLDER_ID} --token "$(cat token.txt)" --non-interactive
+          if [[ "${GITHUB_REF}" == refs/heads/main ]]; then
+            # Если коммит в main – рассчитываем новый тег версии
+            LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+            if [ -z "$LAST_TAG" ]; then
+              NEW_TAG="v1.0.0"
+            else
+              BASE_VERSION=${LAST_TAG#v}
+              IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
+              PATCH=$((PATCH+1))
+              NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+            fi
+            echo "IMAGE_TAG=$NEW_TAG" >> $GITHUB_ENV
+            echo "Will create new tag: $NEW_TAG"
+          else
+            # Если workflow запущен на тег (refs/tags/vX.X.X) – используем существующий тег
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            echo "IMAGE_TAG=$TAG_NAME" >> $GITHUB_ENV
+            echo "Using existing tag: $TAG_NAME"
+          fi
+        shell: bash
+        # Определяем тег Docker-образа:
+        # - Для коммита в main вычисляем новый тег версии (например, v1.0.0, v1.0.1 и т.д.).
+        # - Для запущенного по тегу workflow используем сам этот тег в качестве версии образа.
 
-      - name: Логин в Yandex Container Registry
-        env:
-          YC_TOKEN: ${{ secrets.YC_TOKEN }}
-        run: |
-          # Получаем IAM-токен для Docker login
-          IAM_TOKEN=$(${HOME}/yandex-cloud/bin/yc iam create-token)
-          echo $IAM_TOKEN | docker login --username oauth --password-stdin cr.yandex
-
-      - name: Сборка Docker-образа
-        run: docker build -t cr.yandex/${{ secrets.YCR_REGISTRY_ID }}/test-app:latest ./app
-
-      - name: Push Docker-образа в Registry
-        run: docker push cr.yandex/${{ secrets.YCR_REGISTRY_ID }}/test-app:latest
-
-  # Job 3: Деплой приложения в Kubernetes
-  deploy_k8s:
-    name: "Deploy to Kubernetes"
-    runs-on: ubuntu-latest
-    needs: docker_build
-    if: needs.docker_build.result == 'success'
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Установка kubectl
-        uses: azure/setup-kubectl@v3
+      # Шаг 3: Аутентификация в Docker Hub
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
         with:
-          version: 'latest'
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+        # Логинимся в Docker Hub, используя имя пользователя и пароль из секретов
 
-      - name: Получение kubeconfig из Yandex.Cloud
-        env:
-          YC_TOKEN: ${{ secrets.YC_TOKEN }}
-          YC_CLOUD_ID: ${{ secrets.YC_CLOUD_ID }}
-          YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
+      # Шаг 4: Сборка и отправка Docker-образа
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKER_HUB_USERNAME }}/test:${{ env.IMAGE_TAG }}
+        # Собираем Docker-образ из Dockerfile и пушим его в Docker Hub с новым тегом версии (например, v1.0.0)
+
+      # Шаг 5: Создание нового Git-тега в репозитории (для фиксации версии, только при коммите в main)
+      - name: Create Git tag for new version
+        if: startsWith(github.ref, 'refs/heads/main')
         run: |
-          # Устанавливаем Yandex CLI (если не кэшировалось с предыдущего шага)
-          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -a
-          # Авторизуемся 
-          ${HOME}/yandex-cloud/bin/yc config set token $YC_TOKEN
-          ${HOME}/yandex-cloud/bin/yc config set cloud-id $YC_CLOUD_ID
-          ${HOME}/yandex-cloud/bin/yc config set folder-id $YC_FOLDER_ID
-          # Получаем контекст Kubernetes ( kubeconfig )
-          ${HOME}/yandex-cloud/bin/yc managed-kubernetes cluster get-credentials --name ${YCLUSTER_NAME} --external --force
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ env.IMAGE_TAG }}
+          # Отправляем новый тег в репозиторий
+          git push origin ${{ env.IMAGE_TAG }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Создаём новый тег (например, v1.0.0) на текущем коммите и отправляем его на GitHub.
+        # GITHUB_TOKEN используется для авторизации push (должен иметь право записи).
 
-      - name: Применение манифестов Kubernetes
-        run: kubectl apply -f app/k8s-manifests/
+      # Шаг 6: Установка kubectl (клиент для Kubernetes)
+      - name: Install kubectl
+        run: sudo apt-get update && sudo apt-get install -y kubectl
+        # Устанавливаем утилиту kubectl, необходимую для деплоя в Kubernetes
+
+      # Шаг 7: Настройка доступа к кластеру через kubeconfig (если предоставлен KUBE_CONFIG)
+      - name: Set up kubeconfig from secret
+        if: env.KUBECONFIG_CONTENT != ''
+        run: |
+          echo "$KUBECONFIG_CONTENT" > kubeconfig.yaml
+          echo "KUBECONFIG=$PWD/kubeconfig.yaml" >> $GITHUB_ENV
+        # Если kubeconfig файл доступен (секрет KUBE_CONFIG), сохраняем его содержимое и указываем kubectl использовать его.
+
+      # Шаг 8: Альтернативная настройка доступа через Yandex Cloud IAM (если kubeconfig не предоставлен)
+      - name: Authenticate to Yandex Cloud via Service Account
+        if: env.KUBECONFIG_CONTENT == '' && env.YC_SA_JSON_CREDENTIALS != ''
+        run: |
+          echo "${YC_SA_JSON_CREDENTIALS}" > yc-sa-key.json
+          # Устанавливаем Yandex Cloud CLI (yc)
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -a
+          export PATH="$HOME/yandex-cloud/bin:$PATH"
+          # Конфигурируем yc для работы с сервисным аккаунтом
+          yc config set service-account-key yc-sa-key.json
+          # (При необходимости задайте cloud-id и folder-id, если ваш сервисный аккаунт не привязан по умолчанию)
+          # yc config set cloud-id <Ваш Cloud ID>
+          # yc config set folder-id <Ваш Folder ID>
+          # Получаем kubeconfig для кластера Managed Kubernetes
+          yc managed-kubernetes cluster get-credentials <ID_или_имя_кластера> --external --force
+          echo "KUBECONFIG=$HOME/.kube/config" >> $GITHUB_ENV
+        # Если kubeconfig не задан, используем сервисный аккаунт Yandex Cloud:
+        # - Устанавливаем Yandex CLI и настраиваем его с JSON ключом (IAM) из секрета YC_SA_JSON_CREDENTIALS.
+        # - Получаем и сохраняем kubeconfig для Kubernetes-кластера (необходимо указать ID или имя вашего кластера).
+        # - После выполнения этой команды, kubeconfig сохранён в ~/.kube/config и будет использован kubectl.
+
+      # Шаг 9: Обновление образа в Kubernetes манифестах с новым тегом
+      - name: Update Kubernetes manifests
+        run: |
+          sed -i "s|image: .*/test:.*|image: ${{
+            secrets.DOCKER_HUB_USERNAME }}/test:${{ env.IMAGE_TAG }}|g" deployment.yaml
+        # Обновляем файл deployment.yaml, подставляя новый тег Docker-образа в поле image.
+        # (Предполагается, что в манифесте образ указан как <repo>/test:<old-tag>)
+
+      # Шаг 10: Применение (deploy) обновлённых манифестов в Kubernetes
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -f deployment.yaml
+          kubectl apply -f service.yaml
+        # Применяем (kubectl apply) Deployment и Service манифесты на кластер Kubernetes в Yandex Cloud.
